@@ -21,6 +21,7 @@
 package org.forome.cli.util;
 
 import com.google.gson.JsonArray;
+import com.google.gson.JsonElement;
 import com.google.gson.JsonObject;
 import com.google.gson.JsonParser;
 import lombok.AllArgsConstructor;
@@ -36,39 +37,68 @@ import java.net.HttpURLConnection;
 import java.net.URL;
 import java.net.URLEncoder;
 import java.nio.charset.StandardCharsets;
+import java.util.ArrayList;
 import java.util.Base64;
 import java.util.Map;
+import java.util.Set;
 
 public class Util {
 
-    private static final String XL2WS = "xl2ws";
+    private static final String XL2WS = "ds2ws";
     private static final String ON = "adm_ds_on";
     private static final String JOB_STATUS = "job_status";
     private Configuration configuration;
 
+    private String getBaseURL(JsonObject object)
+    {
+        try {
+            if (object.has ("baseUrl"))
+                return object.get ("baseUrl").getAsString ();
+            String host = object.get ("host").getAsString ();
+            String port = object.get ("port").getAsString ();
+            String base = "/";
+                if (object.has ("html-context")) {
+                    base = object.get ("html-base").getAsString ();
+                if (!base.endsWith ("/"))
+                    base += "/";
+            }
+            if ("0.0.0.0".equals (host))
+                host = "127.0.0.1";
+            return "http://" + host + ":" + port + base;
+        } catch (Exception x) {
+            throw new RuntimeException ("Failed to determine server URL", x);
+        }
+    }
+
     public Util(Map<String,String> args) {
         try (FileReader fileReader = new FileReader(args.get("config"))) {
             JsonObject object = new JsonParser().parse(fileReader).getAsJsonObject();
-            this.configuration = new Configuration(object.get("baseUrl").getAsString(),
+            String login = null;
+            if (object.has ("login"))
+                login = object.get("login").getAsString();
+            String password = null;
+            if (object.has ("password"))
+                password = object.get("password").getAsString();
+
+            this.configuration = new Configuration(getBaseURL (object),
                     args.get("parent"),
                     args.get("rule"),
                     args.get ("ds"),
-                    object.get("login").getAsString(),
-                    object.get("password").getAsString()
+                    login,
+                    password
             );
             System.out.printf("Yours configuration is %s\n", configuration);
-        } catch (Exception e) {
+        } catch (IOException e) {
             System.out.println("File not found! ");
-            throw new RuntimeException();
+            throw new RuntimeException(e);
         }
     }
 
     public boolean activateWorkspace() {
             try {
-                String userCredentials = configuration.getLogin() + ":" + configuration.getPassword();
-                String basicAuth = "Basic " + new String(Base64.getEncoder().encode(userCredentials.getBytes()));
+               String basicAuth = configuration.getBasicAuth ();
                 URL url = new URL(configuration.getBaseUrl() + ON);
-                String urlParameters = String.format("ds=%s", encode(configuration.getDatasetName ()));
+                String urlParameters = String.format("?ds=%s", encode(configuration.getDatasetName ()));
                 HttpURLConnection connection = getHttpURLConnection(url, basicAuth, urlParameters);
                 System.out.printf("Request url is '%s'\n", connection.getURL() + urlParameters);
                 if (HttpURLConnection.HTTP_OK == connection.getResponseCode()) {
@@ -93,24 +123,23 @@ public class Util {
 
     public boolean createWorkspace() {
         try {
-            String userCredentials = configuration.getLogin() + ":" + configuration.getPassword();
-            String basicAuth = "Basic " + new String(Base64.getEncoder().encode(userCredentials.getBytes()));
+            String basicAuth = configuration.getBasicAuth ();
             URL url = new URL(configuration.getBaseUrl() + XL2WS);
-            String urlParameters = String.format("ds=%s&std_name=%s&ws=%s&force=1",
+            String urlParameters = String.format("ds=%s&dtree=%s&ws=%s&force=1",
                     encode(configuration.getParentDatasetName ()),
                     encode(configuration.getTreeName()),
                     encode(configuration.getDatasetName ()));
             HttpURLConnection connection = getHttpURLConnection(url, basicAuth, urlParameters);
-            System.out.printf("Request url is '%s'\n", connection.getURL() + urlParameters);
+            System.out.printf("Request url is '%s?%s\n", connection.getURL(), urlParameters);
             if (HttpURLConnection.HTTP_OK == connection.getResponseCode()) {
                 InputStreamReader inputStreamReader = new InputStreamReader(connection.getInputStream());
                 JsonObject obj = new JsonParser().parse(inputStreamReader).getAsJsonObject();
                 inputStreamReader.close();
                 connection.disconnect();
                 String taskId = obj.get("task_id").getAsString();
-                System.out.println("Sending a request for workspace creation. Task id:" + taskId);
-                while (isCreated(taskId, basicAuth)) {
-                    System.out.println("Checking the workspace creation status.  Task id:" + taskId);
+                System.out.println("Sent a request to create derived dataset. Task id:" + taskId);
+                while (!isCreated(taskId, basicAuth)) {
+                    System.out.printf("Checking task %s status.\n", taskId);
                     Thread.sleep(5000);
                 }
                 return true;
@@ -139,7 +168,47 @@ public class Util {
                 JsonArray jsonArray = new JsonParser().parse(inputStreamReader).getAsJsonArray();
                 inputStreamReader.close();
                 connection.disconnect();
-                return "Done".equals(jsonArray.get(1).getAsString());
+                int n = jsonArray.size ();
+                if (n != 2) {
+                    ArrayList<String> msg = new ArrayList<> ();
+                    for (JsonElement e: jsonArray) {
+                        if (e == null)
+                            msg.add ("null");
+                        else
+                            msg.add (e.toString ());
+                    }
+                    throw new IllegalStateException (
+                        "Unexpected response from server: "
+                        + "[" + String.join (", ", msg) + "]"
+                    );
+                }
+                JsonElement result = jsonArray.get (0);
+                String status = jsonArray.get (1).getAsString ();
+                System.out.println ("Task status: " + status);
+                if (result.isJsonPrimitive ()) {
+                    boolean active = result.getAsBoolean ();
+                    return active;
+                } else if (result.isJsonNull ()) {
+                    System.out.println ("Task returned no result");
+                } else if (result.isJsonObject ()) {
+                    JsonObject js = result.getAsJsonObject ();
+                    Set<Map.Entry<String, JsonElement>> entries =
+                        js.entrySet ();
+                    for (Map.Entry<String, JsonElement> e: entries) {
+                        if ("ws".equalsIgnoreCase (e.getKey ())) {
+                            System.out.println (
+                                "Created derived dataset: "
+                                + e.getValue ()
+                            );
+                        } else {
+                            System.out.printf (
+                                "Result: %s: %s\n",
+                                e.getKey (), e.getValue ()
+                            );
+                        }
+                    }
+                }
+                return true;
             }
         } catch (IOException e) {
             System.out.println("ERROR: " + e);
@@ -157,7 +226,8 @@ public class Util {
         connection.setRequestProperty("Content-Type", "application/x-www-form-urlencoded");
         connection.setRequestProperty("charset", "utf-8");
         connection.setRequestProperty("Content-Length", String.valueOf(postData.length));
-        connection.addRequestProperty("Authorization", basicAuth);
+        if (basicAuth != null)
+            connection.addRequestProperty("Authorization", basicAuth);
         connection.setUseCaches(false);
         try (DataOutputStream wr = new DataOutputStream(connection.getOutputStream())) {
             wr.write(postData);
@@ -191,6 +261,25 @@ public class Util {
                     "dataset: '%s'", baseUrl, login, password,
                 parentDatasetName, treeName,
                 datasetName);
+        }
+
+        String getUserCredentials()
+        {
+            if (login != null && password != null)
+                return login + ":" + password;
+            return null;
+        }
+
+        String getBasicAuth()
+        {
+            String  userCredentials = getUserCredentials ();
+            if (userCredentials == null) {
+                return null;
+            }
+            String basicAuth = "Basic " + new String(
+                Base64.getEncoder().encode(userCredentials.getBytes())
+            );
+            return basicAuth;
         }
     }
 }
